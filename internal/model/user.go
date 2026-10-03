@@ -185,8 +185,10 @@ func NewUser() *User {
 }
 
 // NewUserWithAll returns a User with every field set, in declaration order,
-// equivalent to the Lombok all-args constructor.
-func NewUserWithAll(id int, name, email, password, role, about *string) *User {
+// equivalent to the Lombok all-args constructor. The source entity declares
+// About before Role, so the parameter order is (id, name, email, password,
+// about, role).
+func NewUserWithAll(id int, name, email, password, about, role *string) *User {
 	return &User{
 		ID:       id,
 		Name:     name,
