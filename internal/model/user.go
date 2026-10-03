@@ -1,17 +1,20 @@
-// Package model contains the domain types persisted by the application.
+// Package model contains the domain types persisted by the application,
+// together with the DDL that creates their tables at startup.
 package model
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 )
 
-// Table and column names for the User entity. Hibernate's default physical
-// naming strategy lowercases the @Table/@Column names, so the schema uses the
-// lowercased identifiers. `user` is a reserved word in MySQL and must be
-// backtick-quoted in SQL.
+// Table and column names for the User entity. The source sets @Table/@Column
+// names; Spring Boot's default physical naming strategy lowercases them, so
+// the schema uses the lowercased identifiers. `user` is a reserved word in
+// both MySQL and PostgreSQL and is always quoted in the generated SQL.
 const (
 	UserTable          = "user"
 	UserColumnID       = "user_id"
@@ -23,7 +26,136 @@ const (
 
 	// UserAboutMaxLength mirrors @Column(length = 500) on User_About.
 	UserAboutMaxLength = 500
+
+	// userDefaultVarcharLength is the JPA default @Column length (255) used
+	// for every String column that does not declare an explicit length.
+	userDefaultVarcharLength = 255
+
+	// userEmailUniqueConstraint names the constraint generated from
+	// @Column(unique = true) on User_Email.
+	userEmailUniqueConstraint = "uk_user_user_email"
 )
+
+// Dialect identifies the SQL dialect used to create the schema.
+type Dialect int
+
+const (
+	// DialectMySQL generates MySQL/MariaDB DDL (the source project's database).
+	DialectMySQL Dialect = iota + 1
+	// DialectPostgres generates PostgreSQL DDL.
+	DialectPostgres
+)
+
+// String returns a human-readable dialect name.
+func (d Dialect) String() string {
+	switch d {
+	case DialectMySQL:
+		return "mysql"
+	case DialectPostgres:
+		return "postgres"
+	default:
+		return "unknown(" + strconv.Itoa(int(d)) + ")"
+	}
+}
+
+// DialectFromURL infers the SQL dialect from a database URL / DSN such as
+// config.Config.DatabaseURL. URLs with a postgres:// or postgresql:// scheme
+// map to DialectPostgres; everything else (mysql:// URLs and go-sql-driver
+// DSNs like "user:pass@tcp(host:3306)/db") maps to DialectMySQL.
+func DialectFromURL(databaseURL string) Dialect {
+	lower := strings.ToLower(strings.TrimSpace(databaseURL))
+	if strings.HasPrefix(lower, "postgres://") || strings.HasPrefix(lower, "postgresql://") {
+		return DialectPostgres
+	}
+	return DialectMySQL
+}
+
+// ErrUnknownDialect is returned when a DDL operation receives an unsupported Dialect.
+var ErrUnknownDialect = errors.New("model: unknown SQL dialect")
+
+// SchemaExecer is the minimal database capability needed to create the
+// schema. *sql.DB, *sql.Conn and *sql.Tx all satisfy it.
+type SchemaExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// UserTableDDL returns the CREATE TABLE IF NOT EXISTS statement for the
+// User entity in the given dialect. The columns mirror the JPA mapping:
+//   - user_id:       INT primary key, auto-generated (@Id @GeneratedValue)
+//   - user_name:     VARCHAR(255), nullable (@NotBlank is app-level only)
+//   - user_email:    VARCHAR(255), nullable, UNIQUE (@Column(unique = true))
+//   - user_password: VARCHAR(255), nullable
+//   - user_role:     VARCHAR(255), nullable
+//   - user_about:    VARCHAR(500), nullable (@Column(length = 500))
+func UserTableDDL(d Dialect) (string, error) {
+	varchar := "VARCHAR(" + strconv.Itoa(userDefaultVarcharLength) + ")"
+	aboutVarchar := "VARCHAR(" + strconv.Itoa(UserAboutMaxLength) + ")"
+
+	switch d {
+	case DialectMySQL:
+		q := func(id string) string { return "`" + id + "`" }
+		var b strings.Builder
+		b.WriteString("CREATE TABLE IF NOT EXISTS " + q(UserTable) + " (\n")
+		b.WriteString("  " + q(UserColumnID) + " INT NOT NULL AUTO_INCREMENT,\n")
+		b.WriteString("  " + q(UserColumnName) + " " + varchar + " NULL,\n")
+		b.WriteString("  " + q(UserColumnEmail) + " " + varchar + " NULL,\n")
+		b.WriteString("  " + q(UserColumnPassword) + " " + varchar + " NULL,\n")
+		b.WriteString("  " + q(UserColumnRole) + " " + varchar + " NULL,\n")
+		b.WriteString("  " + q(UserColumnAbout) + " " + aboutVarchar + " NULL,\n")
+		b.WriteString("  PRIMARY KEY (" + q(UserColumnID) + "),\n")
+		b.WriteString("  CONSTRAINT " + q(userEmailUniqueConstraint) + " UNIQUE (" + q(UserColumnEmail) + ")\n")
+		b.WriteString(") ENGINE=InnoDB")
+		return b.String(), nil
+
+	case DialectPostgres:
+		q := func(id string) string { return `"` + id + `"` }
+		var b strings.Builder
+		b.WriteString("CREATE TABLE IF NOT EXISTS " + q(UserTable) + " (\n")
+		b.WriteString("  " + q(UserColumnID) + " SERIAL PRIMARY KEY,\n")
+		b.WriteString("  " + q(UserColumnName) + " " + varchar + " NULL,\n")
+		b.WriteString("  " + q(UserColumnEmail) + " " + varchar + " NULL,\n")
+		b.WriteString("  " + q(UserColumnPassword) + " " + varchar + " NULL,\n")
+		b.WriteString("  " + q(UserColumnRole) + " " + varchar + " NULL,\n")
+		b.WriteString("  " + q(UserColumnAbout) + " " + aboutVarchar + " NULL,\n")
+		b.WriteString("  CONSTRAINT " + q(userEmailUniqueConstraint) + " UNIQUE (" + q(UserColumnEmail) + ")\n")
+		b.WriteString(")")
+		return b.String(), nil
+
+	default:
+		return "", fmt.Errorf("user table ddl for %s: %w", d, ErrUnknownDialect)
+	}
+}
+
+// EnsureUserSchema creates the `user` table (with its auto-increment primary
+// key, unique email constraint and VARCHAR(500) about column) if it does not
+// already exist. It replaces Hibernate's spring.jpa.hibernate.ddl-auto=update
+// table creation and MUST be called once at application startup, right after
+// the database connection is opened and before the HTTP server starts:
+//
+//	db, err := sql.Open(driver, cfg.DatabaseURL)
+//	...
+//	if err := model.EnsureUserSchema(ctx, db, model.DialectFromURL(cfg.DatabaseURL)); err != nil {
+//		return fmt.Errorf("init schema: %w", err)
+//	}
+//
+// The statement is idempotent, so calling it on every boot is safe.
+//
+// MIGRATION_NOTE: ddl-auto=update also ALTERs an existing table to add
+// columns that are missing from it. This function only creates the table
+// when absent; it does not diff or alter a pre-existing table.
+func EnsureUserSchema(ctx context.Context, db SchemaExecer, d Dialect) error {
+	if db == nil {
+		return errors.New("ensure user schema: nil database handle")
+	}
+	ddl, err := UserTableDDL(d)
+	if err != nil {
+		return fmt.Errorf("ensure user schema: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, ddl); err != nil {
+		return fmt.Errorf("ensure user schema: create table %q: %w", UserTable, err)
+	}
+	return nil
+}
 
 // NameBlankMessage is the @NotBlank message declared on User.name.
 const NameBlankMessage = "please Add the department Name"
