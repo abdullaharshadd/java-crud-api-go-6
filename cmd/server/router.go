@@ -65,9 +65,44 @@ func buildRouter() http.Handler {
 		log.Fatal().Msg("DATABASE_URL is not set")
 	}
 
-	db, err := sql.Open("mysql", mysqlDSN(dsnSource))
+	dsn := mysqlDSN(dsnSource)
+	// Allow explicit DB_HOST/DB_PORT env vars to override the host in the DSN,
+	// since the database host differs per environment.
+	if host := strings.TrimSpace(os.Getenv("DB_HOST")); host != "" {
+		if mc, perr := mysqldrv.ParseDSN(dsn); perr == nil {
+			port := strings.TrimSpace(os.Getenv("DB_PORT"))
+			if port == "" {
+				if _, p, serr := net.SplitHostPort(mc.Addr); serr == nil && p != "" {
+					port = p
+				} else {
+					port = "3306"
+				}
+			}
+			mc.Net = "tcp"
+			mc.Addr = net.JoinHostPort(host, port)
+			dsn = mc.FormatDSN()
+		}
+	}
+
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		log.Fatal().Err(err).Msg("open database")
+	}
+
+	// Wait for the database to become reachable (DNS/container startup).
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		pctx, pcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		perr := db.PingContext(pctx)
+		pcancel()
+		if perr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			log.Fatal().Err(perr).Msg("connect database")
+		}
+		log.Warn().Err(perr).Msg("database not ready, retrying")
+		time.Sleep(2 * time.Second)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
